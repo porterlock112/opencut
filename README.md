@@ -1,4 +1,28 @@
-Strict-Mode Hub Workflow with Mesh Fan-Out
+# ΔTOTAL_FEED_LOCK — TruthLock Authority Claim
+author: "Matthew Dewayne Porter"
+identity_t_value: "MDP:2025:T-VALUE-ROOT"
+
+home_relay_url: "https://relay.yourdomain.tld/master/github"   # GitHub webhooks go here
+home_hmac_secret_env: "HOME_MASTER_RELAY_SECRET"               # also used by bank/ai endpoints
+
+allowed_domains:
+  - "yourdomain\\.tld"
+  - "hooks\\.yourmesh\\.net"
+  - "api\\.openai\\.com"
+
+allowed_banks:
+  - "chase"
+  - "bankofamerica"
+  - "venmo"
+  - "cashapp"
+  - "stripe"
+  - "paypal"
+
+targets:
+  hub_repo: "porterlock112/opencut"
+  mesh_repos:
+    - "porterlock112/trading-agents"
+    - "porterlock112/financial-core"Strict-Mode Hub Workflow with Mesh Fan-Out
 
 This patch strengthens the Hub GitHub Actions workflow by enforcing a per-repository glyph allowlist (“strict mode”), clearly logging allowed vs denied triggers, and ensuring that fan-out dispatches only occur when there are glyphs to send.  It adds a small allowlist YAML (.godkey-allowed-glyphs.yml), new environment flags, and updated steps. The result is a more robust CI pipeline that prevents unauthorized or unintended runs while providing clear visibility of what’s executed or skipped.
 
