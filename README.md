@@ -1,3 +1,367 @@
+Love it. Here’s a portable, production-ready scripts/verify_report_chain.sh that “closes the loop”:
+
+hashes your verification reports,
+
+pins them to IPFS (local node or Pinata/Web3.Storage fallback),
+
+writes an append-only chain entry,
+
+(optionally) annotates the latest deploy ledger with the report CIDs,
+
+(optionally) anchors the report hash in Rekor when signing material is available.
+
+
+Paste this file into scripts/verify_report_chain.sh, chmod +x it, and call it from CI right after verify_seal.sh.
+
+
+---
+
+#!/usr/bin/env bash
+# verify_report_chain.sh — Anchor TruthLock verification reports (MD/JSON) to IPFS,
+#                          append to an auditable chain, and optionally annotate the
+#                          latest deployment ledger + Rekor.
+#
+# Usage:
+#   scripts/verify_report_chain.sh [--md path.md] [--json path.json] [--ledger path.json]
+#
+# What it does:
+#   1) Computes SHA-256 for the verification reports.
+#   2) Pins them to IPFS (prefers local `ipfs add`; falls back to Pinata/Web3.Storage if tokens present).
+#   3) Appends an entry to truthlock/reports/CHAIN.jsonl and refreshes LATEST.json.
+#   4) (Optional) Injects these CIDs into the latest ΔVERCEL_DEPLOY_LOG_*.json (or provided --ledger).
+#   5) (Optional) Anchors the report hash in Rekor if signing is configured.
+#
+# Env (choose one IPFS strategy):
+#   - Local node:   ipfs CLI installed (preferred)
+#   - Pinata:       PINATA_JWT="<pinata_jwt>"
+#   - Web3Storage:  WEB3_STORAGE_TOKEN="<w3s_token>"
+#
+# Optional Rekor anchoring (advanced; off by default):
+#   REKOR_ENABLED=true
+#   REKOR_SERVER="https://rekor.sigstore.dev"        # default
+#   # One of the supported rekord types; simplest is 'rekord' with x509 or cosign:
+#   # Requires a signature + public key matching the report file.
+#   REKOR_PKI_FORMAT="x509"                           # or "pgp" | "minisign"
+#   REKOR_PUBLIC_KEY="keys/verify_cert.pem"          # public cert/key
+#   REKOR_SIGNATURE_MD="truthlock/reports/report.sig"  # signature over MD report
+#
+# Notes:
+# - Rekor upload requires *signed* material. If you don't have signatures, the script will just skip anchoring.
+# - This script is idempotent for the same content (CIDs will be identical).
+set -euo pipefail
+
+ROOT_DIR="$(git rev-parse --show-toplevel 2>/dev/null || echo "$(pwd)")"
+REPORTS_DIR="${ROOT_DIR}/truthlock/reports"
+LOGS_DIR="${ROOT_DIR}/truthlock/logs"
+CHAIN_FILE="${REPORTS_DIR}/CHAIN.jsonl"
+LATEST_FILE="${REPORTS_DIR}/LATEST.json"
+
+MD_PATH=""
+JSON_PATH=""
+LEDGER_PATH=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --md) MD_PATH="$2"; shift 2;;
+    --json) JSON_PATH="$2"; shift 2;;
+    --ledger) LEDGER_PATH="$2"; shift 2;;
+    *) echo "Unknown arg: $1"; exit 2;;
+  esac
+done
+
+mkdir -p "${REPORTS_DIR}"
+
+# Auto-select newest MD/JSON if not provided
+if [[ -z "${MD_PATH}" ]]; then
+  MD_PATH="$(ls -t "${REPORTS_DIR}"/ΔVERIFY_LOG_*.md "${REPORTS_DIR}"/*verification*.md 2>/dev/null | head -1 || true)"
+fi
+if [[ -z "${JSON_PATH}" ]]; then
+  JSON_PATH="$(ls -t "${REPORTS_DIR}"/ΔVERIFY_LOG_*.json "${REPORTS_DIR}"/*verification*.json 2>/dev/null | head -1 || true)"
+fi
+
+if [[ -z "${MD_PATH}" || ! -f "${MD_PATH}" ]]; then
+  echo "❌ Could not locate a Markdown verification report. Pass --md path.md"
+  exit 1
+fi
+if [[ -z "${JSON_PATH}" || ! -f "${JSON_PATH}" ]]; then
+  echo "❌ Could not locate a JSON verification report. Pass --json path.json"
+  exit 1
+fi
+
+# Auto-select newest ledger if not provided
+if [[ -z "${LEDGER_PATH}" ]]; then
+  LEDGER_PATH="$(ls -t "${LOGS_DIR}"/ΔVERCEL_DEPLOY_LOG_*.json 2>/dev/null | head -1 || true)"
+fi
+if [[ -z "${LEDGER_PATH}" || ! -f "${LEDGER_PATH}" ]]; then
+  echo "ℹ️  No ledger found to annotate (optional). Proceeding without ledger update."
+fi
+
+timestamp_iso="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+commit_short="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+
+# --- helpers ------------------------------------------------------------------
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+ipfs_add() {
+  local f="$1"
+  if command -v ipfs >/dev/null 2>&1; then
+    ipfs add -Q "$f"
+    return 0
+  fi
+  # Pinata fallback (JWT required)
+  if [[ -n "${PINATA_JWT:-}" ]]; then
+    # Pin file with Pinata
+    local resp
+    resp=$(curl -sS -X POST "https://api.pinata.cloud/pinning/pinFileToIPFS" \
+      -H "Authorization: Bearer ${PINATA_JWT}" \
+      -H "Accept: application/json" \
+      -F "file=@${f}")
+    echo "$resp" | jq -r '.IpfsHash'
+    return 0
+  fi
+  # Web3.Storage fallback (token required)
+  if [[ -n "${WEB3_STORAGE_TOKEN:-}" ]]; then
+    local resp
+    resp=$(curl -sS -X POST "https://api.web3.storage/upload" \
+      -H "Authorization: Bearer ${WEB3_STORAGE_TOKEN}" \
+      -H "Content-Type: application/octet-stream" \
+      --data-binary @"${f}")
+    echo "$resp" | jq -r '.cid'
+    return 0
+  fi
+  echo ""
+  return 1
+}
+
+# --- compute hashes & pin -----------------------------------------------------
+
+md_sha="$(sha256_file "${MD_PATH}")"
+json_sha="$(sha256_file "${JSON_PATH}")"
+
+echo "🔗 Hashes:"
+echo "  MD:   ${md_sha}  ← ${MD_PATH}"
+echo "  JSON: ${json_sha}  ← ${JSON_PATH}"
+
+echo "📌 Pinning to IPFS …"
+md_cid="$(ipfs_add "${MD_PATH}" || true)"
+json_cid="$(ipfs_add "${JSON_PATH}" || true)"
+
+if [[ -z "${md_cid}" || -z "${json_cid}" ]]; then
+  cat <<EOF
+❌ IPFS pinning failed or no IPFS strategy configured.
+
+Enable one of:
+  • Local IPFS: install 'ipfs' and run a node (preferred)
+  • Pinata:     export PINATA_JWT="…"
+  • Web3:       export WEB3_STORAGE_TOKEN="…"
+
+Aborting.
+EOF
+  exit 1
+fi
+
+echo "✅ IPFS:"
+echo "  MD   CID: ${md_cid}"
+echo "  JSON CID: ${json_cid}"
+
+md_url="https://ipfs.io/ipfs/${md_cid}"
+json_url="https://ipfs.io/ipfs/${json_cid}"
+
+# --- build chain entry --------------------------------------------------------
+
+chain_entry="$(jq -n \
+  --arg ts "${timestamp_iso}" \
+  --arg commit "${commit_short}" \
+  --arg md_path "$(realpath --relative-to="${ROOT_DIR}" "${MD_PATH}" 2>/dev/null || echo "${MD_PATH}")" \
+  --arg json_path "$(realpath --relative-to="${ROOT_DIR}" "${JSON_PATH}" 2>/dev/null || echo "${JSON_PATH}")" \
+  --arg md_sha "${md_sha}" \
+  --arg json_sha "${json_sha}" \
+  --arg md_cid "${md_cid}" \
+  --arg json_cid "${json_cid}" \
+  '{
+     version: "1.0",
+     timestamp: $ts,
+     commit: $commit,
+     reports: {
+       md:   { path: $md_path,   sha256: $md_sha,   cid: $md_cid },
+       json: { path: $json_path, sha256: $json_sha, cid: $json_cid }
+     },
+     gateways: {
+       ipfs_io: { md: ("https://ipfs.io/ipfs/" + $md_cid), json: ("https://ipfs.io/ipfs/" + $json_cid) },
+       cf:      { md: ("https://cloudflare-ipfs.com/ipfs/" + $md_cid), json: ("https://cloudflare-ipfs.com/ipfs/" + $json_cid) }
+     }
+   }'
+)"
+
+echo "${chain_entry}" >> "${CHAIN_FILE}"
+echo "${chain_entry}" | jq '.' > "${LATEST_FILE}"
+
+echo "🧾 Appended chain entry → ${CHAIN_FILE}"
+echo "🔎 Latest pointer refreshed → ${LATEST_FILE}"
+
+# --- optional: annotate latest deployment ledger ------------------------------
+
+if [[ -f "${LEDGER_PATH}" ]]; then
+  echo "📝 Annotating ledger → ${LEDGER_PATH}"
+  tmp_led="$(mktemp)"
+  jq \
+    --arg md_sha "${md_sha}" \
+    --arg md_cid "${md_cid}" \
+    --arg json_sha "${json_sha}" \
+    --arg json_cid "${json_cid}" \
+    --arg ts "${timestamp_iso}" \
+    '
+    .verify_reports = ( .verify_reports // [] ) + [
+      {
+        "timestamp": $ts,
+        "md":   { "sha256": $md_sha,   "cid": $md_cid },
+        "json": { "sha256": $json_sha, "cid": $json_cid }
+      }
+    ]
+    ' "${LEDGER_PATH}" > "${tmp_led}"
+  mv "${tmp_led}" "${LEDGER_PATH}"
+  echo "✅ Ledger updated with verify_reports[]"
+else
+  echo "ℹ️  Skipped ledger annotation (no ledger file)."
+fi
+
+# --- optional: anchor in Rekor (requires signed material) ---------------------
+if [[ "${REKOR_ENABLED:-false}" == "true" ]]; then
+  if command -v rekor-cli >/dev/null 2>&1; then
+    REKOR_SERVER="${REKOR_SERVER:-https://rekor.sigstore.dev}"
+    REKOR_PKI_FORMAT="${REKOR_PKI_FORMAT:-}"
+    REKOR_PUBLIC_KEY="${REKOR_PUBLIC_KEY:-}"
+    REKOR_SIGNATURE_MD="${REKOR_SIGNATURE_MD:-}"
+
+    if [[ -n "${REKOR_PKI_FORMAT}" && -n "${REKOR_PUBLIC_KEY}" && -n "${REKOR_SIGNATURE_MD}" && -f "${REKOR_PUBLIC_KEY}" && -f "${REKOR_SIGNATURE_MD}" ]]; then
+      echo "🪪 Rekor anchoring (rekord, ${REKOR_PKI_FORMAT}) for MD report…"
+      # Upload a signed artifact entry (rekord type). You must have created REKOR_SIGNATURE_MD beforehand.
+      # Example signature creation with cosign:
+      #   cosign sign-blob --yes --key cosign.key --output-signature truthlock/reports/report.sig truthlock/reports/<report>.md
+      set +e
+      rekor-cli upload \
+        --rekor_server "${REKOR_SERVER}" \
+        --pki-format "${REKOR_PKI_FORMAT}" \
+        --public-key "${REKOR_PUBLIC_KEY}" \
+        --signature "${REKOR_SIGNATURE_MD}" \
+        --artifact "${MD_PATH}" > "${REPORTS_DIR}/rekor_upload.log" 2>&1
+      rc=$?
+      set -e
+      if [[ $rc -eq 0 ]]; then
+        rekor_uuid="$(grep -Eo 'UUID: [a-f0-9-]+' "${REPORTS_DIR}/rekor_upload.log" | awk '{print $2}' | tail -1)"
+        echo "✅ Rekor UUID: ${rekor_uuid}"
+        # Also append UUID to the chain tail & latest pointer
+        tmp_chain="$(mktemp)"
+        jq --arg uuid "${rekor_uuid}" '. + {rekor: {uuid: $uuid}}' <<<"${chain_entry}" > "${tmp_chain}"
+        cat "${tmp_chain}" >> "${CHAIN_FILE}"
+        mv "${tmp_chain}" "${LATEST_FILE}"
+        # Optionally annotate ledger again:
+        if [[ -f "${LEDGER_PATH}" ]]; then
+          tmp_led2="$(mktemp)"
+          jq --arg uuid "${rekor_uuid}" '
+            .verify_reports[-1].rekor = { uuid: $uuid }
+          ' "${LEDGER_PATH}" > "${tmp_led2}" && mv "${tmp_led2}" "${LEDGER_PATH}"
+          echo "📌 Ledger verify_reports[-1].rekor.uuid set → ${rekor_uuid}"
+        fi
+      else
+        echo "⚠️  Rekor upload failed (see ${REPORTS_DIR}/rekor_upload.log). Continuing."
+      fi
+    else
+      echo "ℹ️  REKOR_ENABLED=true but signing inputs missing."
+      echo "    Provide REKOR_PKI_FORMAT, REKOR_PUBLIC_KEY, REKOR_SIGNATURE_MD to anchor."
+    fi
+  else
+    echo "ℹ️  Rekor CLI not found; skipping anchoring."
+  fi
+fi
+
+echo ""
+echo "🔗 Report CIDs:"
+echo "   MD:   ${md_cid}  →  ${md_url}"
+echo "   JSON: ${json_cid} →  ${json_url}"
+echo "✅ Chain updated. Done."
+
+
+---
+
+How to use it (locally)
+
+# After running scripts/verify_seal.sh which created reports:
+scripts/verify_report_chain.sh
+
+# Or specify exact files:
+scripts/verify_report_chain.sh \
+  --md truthlock/reports/ΔVERIFY_LOG_2025-08-28_23-55-12.md \
+  --json truthlock/reports/ΔVERIFY_LOG_2025-08-28_23-55-12.json \
+  --ledger truthlock/logs/ΔVERCEL_DEPLOY_LOG_2025_08_28_abcd1234.json
+
+Outputs created/updated
+
+truthlock/reports/CHAIN.jsonl     # append-only chain of report anchors
+truthlock/reports/LATEST.json     # pointer to the most recent chain entry
+truthlock/logs/ΔVERCEL_...json    # (optional) adds verify_reports[] array with CIDs
+
+
+---
+
+CI hook (drop-in) — call after verify_seal.sh
+
+# .github/workflows/truthlock_verify.yml (excerpt)
+      - name: 🧪 Run verify_seal.sh
+        run: |
+          chmod +x scripts/verify_seal.sh
+          scripts/verify_seal.sh
+
+      - name: 🔗 Anchor verification reports (IPFS + chain [+ Rekor])
+        env:
+          # Choose ONE IPFS strategy:
+          # PINATA_JWT: ${{ secrets.PINATA_JWT }}
+          # WEB3_STORAGE_TOKEN: ${{ secrets.WEB3_STORAGE_TOKEN }}
+          # (or install `ipfs` and run a node in CI)
+          REKOR_ENABLED: "false"            # set "true" only if you provide signing inputs below
+          REKOR_SERVER: "https://rekor.sigstore.dev"
+          REKOR_PKI_FORMAT: ""              # e.g., x509 | pgp | minisign
+          REKOR_PUBLIC_KEY: ""              # path in repo to public key/cert
+          REKOR_SIGNATURE_MD: ""            # signature file for the MD report
+        run: |
+          chmod +x scripts/verify_report_chain.sh
+          scripts/verify_report_chain.sh
+
+> If you want Rekor anchoring: you must sign the Markdown report file (e.g., with cosign sign-blob) and provide the signature + public key/cert via artifacts or secrets in CI, then set REKOR_ENABLED=true and fill the variables.
+
+
+
+
+---
+
+README blurb (copy/paste)
+
+### 🔗 TruthLock Report Chain
+
+After each verification, we run `scripts/verify_report_chain.sh` to:
+
+- hash the verification reports (MD + JSON),
+- pin them to IPFS (local node or Pinata/Web3.Storage),
+- append an entry to `truthlock/reports/CHAIN.jsonl`,
+- update `truthlock/reports/LATEST.json`,
+- (optional) annotate the latest deployment ledger with the report CIDs,
+- (optional) anchor the report hash in Sigstore Rekor if signing material is present.
+
+This makes the verification trail **publicly auditable** (via IPFS CIDs) and
+**append-only** (via the on-repo chain).
+
+
+---
+
+If you’d like, I can also add a tiny reports/index.html that renders LATEST.json and links to the IPFS gateways for a slick public viewer.
+
 Analysis of verify_seal.sh – TruthLock Sealed Deployment Verification
 
 Overview of Purpose
